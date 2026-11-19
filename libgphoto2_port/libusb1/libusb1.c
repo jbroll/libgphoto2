@@ -116,39 +116,44 @@ struct _PrivateIrqCompleted {
 /* FIXME: safe size? */
 #define INTERRUPT_BUFFER_SIZE 256
 
-#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
-static struct _GPPortExternalSysDevice {
-	/* some more may be used in future */
-	libusb_device_handle *h;
-	libusb_device *d;
-	libusb_context *ctx;
-	libusb_device *dl[1];
-} external_sys_device = { NULL, NULL, NULL, { NULL } };
-
-static int has_external_fd()
+/* Each port wraps the fd selected by gp_port_usb_set_sys_device() when it is
+ * initialised, in a context of its own, so several fds can be open at once. */
+static int
+init_context (libusb_context **ctx, libusb_device_handle **wrapped)
 {
-	if (gp_port_usb_get_sys_device() == -1)
-		return 0;
-	if (external_sys_device.h)
-		return 1;
+	*wrapped = NULL;
+#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
+	int fd = gp_port_usb_get_sys_device ();
+
+	if (fd != -1) {
+		int r;
+
 #ifdef HAVE_LIBUSB_OPTION_NO_DEVICE_DISCOVERY
-	libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY, NULL);
+		libusb_set_option (NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY, NULL);
 #endif
-	C_LIBUSB (libusb_init (&external_sys_device.ctx), GP_ERROR_IO);
-	LOG_ON_LIBUSB_E(libusb_wrap_sys_device(external_sys_device.ctx, gp_port_usb_get_sys_device(), &external_sys_device.h));
-	external_sys_device.d = libusb_get_device(external_sys_device.h);
-	external_sys_device.dl[0] = external_sys_device.d;
-	return 1;
+		C_LIBUSB (libusb_init (ctx), GP_ERROR_IO);
+		r = LOG_ON_LIBUSB_E (libusb_wrap_sys_device (*ctx, fd, wrapped));
+		if (r < LIBUSB_SUCCESS) {
+			libusb_exit (*ctx);
+			*ctx = NULL;
+			*wrapped = NULL;
+			return translate_libusb_error (r, GP_ERROR_IO);
+		}
+		GP_LOG_D ("wrapped fd %d", fd);
+		return GP_OK;
+	}
+#endif
+	C_LIBUSB (libusb_init (ctx), GP_ERROR_IO);
+	return GP_OK;
 }
-
-
-#endif
 
 
 struct _GPPortPrivateLibrary {
 	libusb_context *ctx;
 	libusb_device *d;
 	libusb_device_handle *dh;
+	libusb_device_handle *wrapped;
+	libusb_device *wrapped_dev[1];
 
 	int config;
 	int interface;
@@ -183,29 +188,26 @@ static ssize_t
 load_devicelist (GPPortPrivateLibrary *pl) {
 	time_t	xtime;
 
-	time(&xtime);
-#if HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (!has_external_fd()) /* when external device present no need to research for Android */
-#endif
-	{
-		if (xtime != pl->devslastchecked) {
-			if (pl->nrofdevs)
-				libusb_free_device_list (pl->devs, 1);
-			free (pl->descs);
-			pl->nrofdevs = 0;
-			pl->devs = NULL;
-			pl->descs = NULL;
+	if (pl->wrapped) {
+		if (!pl->nrofdevs) {
+			C_MEM (pl->descs = calloc (1, sizeof(pl->descs[0])));
+			pl->devs = pl->wrapped_dev;
+			LOG_ON_LIBUSB_E (libusb_get_device_descriptor(pl->devs[0], &pl->descs[0]));
+			pl->nrofdevs = 1;
 		}
+		return pl->nrofdevs;
 	}
 
-#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (has_external_fd()) {
-		pl->nrofdevs = 1;
-		pl->devs = external_sys_device.dl;
-		C_MEM (pl->descs = calloc (1, sizeof(pl->descs[0])));
-		LOG_ON_LIBUSB_E (libusb_get_device_descriptor(pl->devs[0], &pl->descs[0]));
+	time(&xtime);
+	if (xtime != pl->devslastchecked) {
+		if (pl->nrofdevs)
+			libusb_free_device_list (pl->devs, 1);
+		free (pl->descs);
+		pl->nrofdevs = 0;
+		pl->devs = NULL;
+		pl->descs = NULL;
 	}
-#endif
+
 	if (!pl->nrofdevs) {
 		int 	i;
 
@@ -225,19 +227,13 @@ gp_port_library_list (GPPortInfoList *list)
 	int		nrofdevices = 0;
 	int		d, i, i1, i2, unknownint;
 	libusb_context	*ctx;
+	libusb_device_handle	*wrapped;
+	libusb_device	*wrapped_dev[1];
 	libusb_device	**devs = NULL;
 	int		nrofdevs = 0;
 	struct libusb_device_descriptor	*descs;
 
-#ifdef  HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (has_external_fd()) {
-		ctx = external_sys_device.ctx;
-	} else {
-		C_LIBUSB (libusb_init (&ctx), GP_ERROR_IO);
-	}
-#else
-	C_LIBUSB (libusb_init (&ctx), GP_ERROR_IO);
-#endif
+	C_GP (init_context (&ctx, &wrapped));
 
 	/* TODO: make sure libusb_exit gets called in all error paths inside this function */
 
@@ -248,13 +244,11 @@ gp_port_library_list (GPPortInfoList *list)
 	gp_port_info_set_path (info, "^usb:");
 	gp_port_info_list_append (list, info); /* do not check return value, it might be -1 */
 
-#ifdef  HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (has_external_fd()) {
+	if (wrapped) {
 		nrofdevs = 1;
-		devs = external_sys_device.dl;
-	} else
-#endif
-	{
+		wrapped_dev[0] = libusb_get_device (wrapped);
+		devs = wrapped_dev;
+	} else {
 		nrofdevs = libusb_get_device_list (ctx, &devs);
 		if (!nrofdevs) {
 			libusb_exit (ctx); /* should free all stuff above */
@@ -368,13 +362,11 @@ gp_port_library_list (GPPortInfoList *list)
 		C_GP (gp_port_info_list_append (list, info));
 	}
 
-#ifdef  HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (!has_external_fd())
-#endif
-	{
+	if (wrapped)
+		libusb_close (wrapped);
+	else
 		libusb_free_device_list (devs, 1);
-		libusb_exit (ctx); /* should free all stuff above */
-	}
+	libusb_exit (ctx); /* should free all stuff above */
 	free (descs);
 
 nodevices:
@@ -392,23 +384,21 @@ nodevices:
 
 static int gp_libusb1_init (GPPort *port)
 {
+	int ret;
+
 	C_MEM (port->pl = malloc (sizeof (GPPortPrivateLibrary)));
 	memset (port->pl, 0, sizeof (GPPortPrivateLibrary));
 
 	port->pl->config = port->pl->interface = port->pl->altsetting = -1;
 
-#ifdef  HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (has_external_fd()) {
-		port->pl->ctx = external_sys_device.ctx;
-	} else
-#endif
-	{
-		if (LOG_ON_LIBUSB_E (libusb_init (&port->pl->ctx))) {
-			free (port->pl);
-			port->pl = NULL;
-			return GP_ERROR_IO;
-		}
+	ret = init_context (&port->pl->ctx, &port->pl->wrapped);
+	if (ret < GP_OK) {
+		free (port->pl);
+		port->pl = NULL;
+		return ret;
 	}
+	if (port->pl->wrapped)
+		port->pl->wrapped_dev[0] = libusb_get_device (port->pl->wrapped);
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 	unlink("usblog.raw");
 	port->pl->logfd = open("usblog.raw",O_CREAT|O_WRONLY,0644);
@@ -427,20 +417,12 @@ gp_libusb1_exit (GPPort *port)
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 		if (port->pl->logfd >=0) close (port->pl->logfd);
 #endif
-		if (port->pl->nrofdevs) {
-#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
-			if (!has_external_fd())
-#endif
-			{
-				libusb_free_device_list (port->pl->devs, 1);
-			}
-		}
-#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
-		if (!has_external_fd())
-#endif
-		{
-			libusb_exit (port->pl->ctx);
-		}
+		/* libusb never closes a wrapped fd; the fd's owner does. */
+		if (port->pl->wrapped)
+			libusb_close (port->pl->wrapped);
+		else if (port->pl->nrofdevs)
+			libusb_free_device_list (port->pl->devs, 1);
+		libusb_exit (port->pl->ctx);
 		free (port->pl);
 		port->pl = NULL;
 	}
@@ -462,17 +444,10 @@ gp_libusb1_open (GPPort *port)
 		C_PARAMS (port->pl->d);
 	}
 
-#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (gp_port_usb_get_sys_device() != -1) {
-		if (!external_sys_device.h) {
-			LOG_ON_LIBUSB_E(libusb_wrap_sys_device(port->pl->ctx, gp_port_usb_get_sys_device(), &external_sys_device.h));
-			libusb_ref_device(libusb_get_device(external_sys_device.h));
-		}
-		port->pl->dh = external_sys_device.h;
-		port->pl->d = libusb_get_device(external_sys_device.h);
-	} else
-#endif
-	{
+	if (port->pl->wrapped) {
+		port->pl->dh = port->pl->wrapped;
+		port->pl->d = port->pl->wrapped_dev[0];
+	} else {
 		C_LIBUSB (libusb_open (port->pl->d, &port->pl->dh), GP_ERROR_IO);
 	}
 	if (!port->pl->dh) {
@@ -588,9 +563,6 @@ gp_libusb1_close (GPPort *port)
 
 	_close_async_interrupts(port);
 
-#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
-	if (gp_port_usb_get_sys_device() == -1) {
-#endif
 	if (libusb_release_interface (port->pl->dh,
 				   port->settings.usb.interface) < 0) {
 		int saved_errno = errno;
@@ -620,10 +592,9 @@ gp_libusb1_close (GPPort *port)
 			gp_port_set_error (port, _("Could not reattach kernel driver of camera device."));
 	}
 
-	libusb_close (port->pl->dh);
-#ifdef HAVE_LIBUSB_WRAP_SYS_DEVICE
-	}
-#endif
+	/* A wrapped handle lives until gp_libusb1_exit, so the port can reopen it. */
+	if (port->pl->dh != port->pl->wrapped)
+		libusb_close (port->pl->dh);
 
 	struct _PrivateIrqCompleted *irq_iter;
 	struct _PrivateIrqCompleted *irq_next;
