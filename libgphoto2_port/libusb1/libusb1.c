@@ -126,12 +126,12 @@ init_context (libusb_context **ctx, libusb_device_handle **wrapped)
 	int fd = gp_port_usb_get_sys_device ();
 
 	if (fd != -1) {
+		/* Per context: a NULL-context libusb_set_option also writes into
+		 * whichever live context libusb picked as its implicit default. */
+		struct libusb_init_option opt = { .option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY };
 		int r;
 
-#ifdef HAVE_LIBUSB_OPTION_NO_DEVICE_DISCOVERY
-		libusb_set_option (NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY, NULL);
-#endif
-		C_LIBUSB (libusb_init (ctx), GP_ERROR_IO);
+		C_LIBUSB (libusb_init_context (ctx, &opt, 1), GP_ERROR_IO);
 		r = LOG_ON_LIBUSB_E (libusb_wrap_sys_device (*ctx, fd, wrapped));
 		if (r < LIBUSB_SUCCESS) {
 			libusb_exit (*ctx);
@@ -231,14 +231,15 @@ gp_port_library_list (GPPortInfoList *list)
 	libusb_device	*wrapped_dev[1];
 	libusb_device	**devs = NULL;
 	int		nrofdevs = 0;
-	struct libusb_device_descriptor	*descs;
+	struct libusb_device_descriptor	*descs = NULL;
+	int		ret;
 
 	C_GP (init_context (&ctx, &wrapped));
 
-	/* TODO: make sure libusb_exit gets called in all error paths inside this function */
-
 	/* generic matcher. This will catch passed XXX,YYY entries for instance. */
-	C_GP (gp_port_info_new (&info));
+	ret = gp_port_info_new (&info);
+	if (ret < GP_OK)
+		goto out;
 	gp_port_info_set_type (info, GP_PORT_USB);
 	gp_port_info_set_name (info, "");
 	gp_port_info_set_path (info, "^usb:");
@@ -250,13 +251,15 @@ gp_port_library_list (GPPortInfoList *list)
 		devs = wrapped_dev;
 	} else {
 		nrofdevs = libusb_get_device_list (ctx, &devs);
-		if (!nrofdevs) {
-			libusb_exit (ctx); /* should free all stuff above */
-			goto nodevices;
-		}
+		if (nrofdevs <= 0)
+			goto out;
 	}
 
-	C_MEM (descs = calloc (nrofdevs, sizeof(descs[0])));
+	descs = calloc (nrofdevs, sizeof(descs[0]));
+	if (!descs) {
+		ret = GP_ERROR_NO_MEMORY;
+		goto out;
+	}
 	for (i=0;i<nrofdevs;i++)
 		LOG_ON_LIBUSB_E (libusb_get_device_descriptor(devs[i], &descs[i]));
 
@@ -351,7 +354,9 @@ gp_port_library_list (GPPortInfoList *list)
 		/* Note: We do not skip USB storage. Some devices can support both,
 		 * and the Ricoh erroneously reports it.
 		 */
-		C_GP (gp_port_info_new (&info));
+		ret = gp_port_info_new (&info);
+		if (ret < GP_OK)
+			goto out;
 		gp_port_info_set_type (info, GP_PORT_USB);
 		gp_port_info_set_name (info, "Universal Serial Bus");
 		snprintf (path,sizeof(path), "usb:%03d,%03d",
@@ -359,17 +364,21 @@ gp_port_library_list (GPPortInfoList *list)
 			libusb_get_device_address (devs[d])
 		);
 		gp_port_info_set_path (info, path);
-		C_GP (gp_port_info_list_append (list, info));
+		ret = gp_port_info_list_append (list, info);
+		if (ret < GP_OK)
+			goto out;
 	}
 
+out:
 	if (wrapped)
 		libusb_close (wrapped);
-	else
+	else if (devs)
 		libusb_free_device_list (devs, 1);
-	libusb_exit (ctx); /* should free all stuff above */
+	libusb_exit (ctx);
 	free (descs);
+	if (ret < GP_OK)
+		return ret;
 
-nodevices:
 	/* This will only be added if no other device was ever added.
 	 * Users doing "usb:" usage will enter the regular expression matcher case. */
 	if (nrofdevices == 0) {
@@ -409,10 +418,27 @@ static int gp_libusb1_init (GPPort *port)
 	return GP_OK;
 }
 
+static void
+free_irqs (GPPortPrivateLibrary *pl)
+{
+	struct _PrivateIrqCompleted *irq_iter = pl->irqs_head;
+	struct _PrivateIrqCompleted *irq_next;
+
+	while (irq_iter != NULL) {
+		free(irq_iter->data);
+		irq_next = irq_iter->next;
+		free(irq_iter);
+		irq_iter = irq_next;
+	}
+	pl->irqs_head = NULL;
+	pl->irqs_tail = NULL;
+}
+
 static int
 gp_libusb1_exit (GPPort *port)
 {
 	if (port->pl) {
+		free_irqs (port->pl);
 		free (port->pl->descs);
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 		if (port->pl->logfd >=0) close (port->pl->logfd);
@@ -556,6 +582,8 @@ _close_async_interrupts(GPPort *port)
 static int
 gp_libusb1_close (GPPort *port)
 {
+	int r;
+
 	C_PARAMS (port);
 
 	if (port->pl->dh == NULL)
@@ -563,8 +591,9 @@ gp_libusb1_close (GPPort *port)
 
 	_close_async_interrupts(port);
 
-	if (libusb_release_interface (port->pl->dh,
-				   port->settings.usb.interface) < 0) {
+	/* An unplugged device has nothing left to release; finish the teardown. */
+	r = libusb_release_interface (port->pl->dh, port->settings.usb.interface);
+	if (r < 0 && r != LIBUSB_ERROR_NO_DEVICE) {
 		int saved_errno = errno;
 		gp_port_set_error (port, _("Could not release interface %d (%s)."),
 				   port->settings.usb.interface,
@@ -587,7 +616,7 @@ gp_libusb1_close (GPPort *port)
 		}
 	}
 #endif
-	if (port->pl->detached) {
+	if (port->pl->detached && r != LIBUSB_ERROR_NO_DEVICE) {
 		if (LOG_ON_LIBUSB_E (libusb_attach_kernel_driver (port->pl->dh, port->settings.usb.interface)))
 			gp_port_set_error (port, _("Could not reattach kernel driver of camera device."));
 	}
@@ -596,18 +625,7 @@ gp_libusb1_close (GPPort *port)
 	if (port->pl->dh != port->pl->wrapped)
 		libusb_close (port->pl->dh);
 
-	struct _PrivateIrqCompleted *irq_iter;
-	struct _PrivateIrqCompleted *irq_next;
-
-	irq_iter=port->pl->irqs_head;
-	while (irq_iter != NULL) {
-		free(irq_iter->data);
-		irq_next = irq_iter->next;
-		free(irq_iter);
-		irq_iter = irq_next;
-	}
-	port->pl->irqs_head = NULL;
-	port->pl->irqs_tail = NULL;
+	free_irqs (port->pl);
 	port->pl->dh = NULL;
 	return GP_OK;
 }
